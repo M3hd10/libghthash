@@ -60,15 +60,23 @@
 #define GHT_HASH_TABLE_H
 
 #include <stdlib.h>                    /* size_t */
+#include <stdint.h>		       /* uint64_t */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define GHT_HEURISTICS_NONE          0
-#define GHT_HEURISTICS_TRANSPOSE     1
-#define GHT_HEURISTICS_MOVE_TO_FRONT 2
-#define GHT_AUTOMATIC_REHASH         4
+#define GHT_HEURISTICS_NONE           0
+#define GHT_HEURISTICS_TRANSPOSE      1
+#define GHT_HEURISTICS_MOVE_TO_FRONT  2
+#define GHT_AUTOMATIC_REHASH          4
+
+
+#define HASH_DYNAMIC_MEM              1
+#define HASH_STATIC_MEM               2
+
+
+//#define __EVENT_DEBUG_MODE__
 
 #ifndef TRUE
 #define TRUE 1
@@ -78,8 +86,11 @@ extern "C" {
 #define FALSE 0
 #endif
 
+//iteration type
+typedef enum { HASH_ITERATOR_WAIT, HASH_ITERATOR_SKIP_BUCKET, HASH_ITERATOR_SKIP_ENTRY }iteration_type;
+
 /** unsigned 32 bit integer. */
-typedef unsigned @INT32_T@ ght_uint32_t;
+typedef unsigned int ght_uint32_t;
 
 /**
  * The structure for hash keys. You should not care about this
@@ -104,8 +115,15 @@ typedef struct s_hash_entry
   struct s_hash_entry *p_prev;
   struct s_hash_entry *p_older;
   struct s_hash_entry *p_newer;
+  
   ght_hash_key_t key;
+  
+  int refCount;
 
+#ifdef __EVENT_DEBUG_MODE__
+  char event[100];
+  int eventCnt[100];
+#endif
 } ght_hash_entry_t;
 
 /*
@@ -118,6 +136,23 @@ typedef struct
   ght_hash_entry_t *p_entry; /* The current entry */
   ght_hash_entry_t *p_next;  /* The next entry */
 } ght_iterator_t;
+
+/**
+ * The structure used in iteration of lockless version of library.
+ * In lockless version don't need 'next' field, because it may be
+ * changed by delete function. The entry field of iterator move to
+ * the next element by lockless_ght_next() function and set to the
+ * first element by lockless_ght_first() fucntion.
+ */
+typedef struct
+{
+  ght_hash_entry_t *p_entry;
+  ght_hash_entry_t *p_next;
+  int next_ibucket;
+  char was_forwarded_by_delete;
+  iteration_type type;
+  int jumpCounter;
+}lockless_ght_iterator_t;
 
 /**
  * Definition of the hash function pointers. @c ght_fn_hash_t should be
@@ -179,12 +214,15 @@ typedef struct
 
   /* private: */
   ght_hash_entry_t **pp_entries;
-  int *p_nr;                         /* The number of entries in each bucket */
+  unsigned int *p_nr;                         /* The number of entries in each bucket */
   int i_size_mask;                   /* The number of bits used in the size */
   unsigned int bucket_limit;
 
   ght_hash_entry_t *p_oldest;        /* The entry inserted the earliest. */
   ght_hash_entry_t *p_newest;        /* The entry inserted the latest. */
+
+  u_int8_t mem_type;
+
 } ght_hash_table_t;
 
 /**
@@ -353,8 +391,25 @@ unsigned int ght_table_size(ght_hash_table_t *p_ht);
  * @return 0 if the element could be inserted, -1 otherwise.
  */
 int ght_insert(ght_hash_table_t *p_ht,
-	       void *p_entry_data,
-	       unsigned int i_key_size, const void *p_key_data);
+         void *p_entry_data,
+         unsigned int i_key_size, const void *p_key_data);
+
+/**
+ * this function is approapriate for lockless version of insertion
+ * In this function pointers of older and newer and variable of p_nr
+ * and i_size is not used!
+ * @param p_ht the hash table to insert into.
+ * @param p_entry_data the data to insert.
+ * @param i_key_size the size of the key to associate the data with (in bytes).
+ * @param p_key_data the key to use. The value will be copied, and it
+ *        is therefore OK to use a stack-allocated entry here.
+ *
+ * @return 0 if the element could be inserted, -1 otherwise.
+ *
+ */
+int lockless_ght_insert(ght_hash_table_t *p_ht,
+         void *p_entry_data,
+         unsigned int i_key_size, const void *p_key_data);
 
 /**
  * Replace an entry in the hash table. This function will return an
@@ -370,9 +425,21 @@ int ght_insert(ght_hash_table_t *p_ht,
  * @return a pointer to the <I>old</I> value or NULL if the operation failed.
  */
 void *ght_replace(ght_hash_table_t *p_ht,
-		  void *p_entry_data,
-		  unsigned int i_key_size, const void *p_key_data);
+      void *p_entry_data,
+      unsigned int i_key_size, const void *p_key_data);
 
+/**
+ * Lookup an entry in the hash table. The entry is <I>not</I> removed from
+ * the table.
+ *
+ * @param p_ht the hash table to search in.
+ * @param i_key_size the size of the key to search with (in bytes).
+ * @param p_key_data the key to search for.
+ *
+ * @return a pointer to the found entry or NULL if no entry could be found.
+ */
+void *lockless_ght_get(ght_hash_table_t *p_ht,
+        unsigned int i_key_size, const void *p_key_data);
 
 /**
  * Lookup an entry in the hash table. The entry is <I>not</I> removed from
@@ -385,7 +452,24 @@ void *ght_replace(ght_hash_table_t *p_ht,
  * @return a pointer to the found entry or NULL if no entry could be found.
  */
 void *ght_get(ght_hash_table_t *p_ht,
-	      unsigned int i_key_size, const void *p_key_data);
+        unsigned int i_key_size, const void *p_key_data);
+
+/**
+ * Remove an entry from the hash table. The entry is removed from the
+ * table, but not freed (that is, the data stored is not freed).
+ *
+ * @param p_ht the hash table to use.
+ * @param i_key_size the size of the key to search with (in bytes).
+ * @param p_key_data the key to search for.
+ *
+ * @return a pointer to the removed entry or NULL if the entry could be found.
+ */
+void *lockless_ght_remove(ght_hash_table_t *p_ht,
+     unsigned int i_key_size, const void *p_key_data);
+
+
+//this function remove an iterator.
+void *lockless_ght_iterator_remove(ght_hash_table_t *p_ht, lockless_ght_iterator_t *p_iterator, const void **p_key);
 
 /**
  * Remove an entry from the hash table. The entry is removed from the
@@ -398,7 +482,7 @@ void *ght_get(ght_hash_table_t *p_ht,
  * @return a pointer to the removed entry or NULL if the entry could be found.
  */
 void *ght_remove(ght_hash_table_t *p_ht,
-		 unsigned int i_key_size, const void *p_key_data);
+     unsigned int i_key_size, const void *p_key_data);
 
 /**
  * Return the first entry in the hash table. This function should be
@@ -513,6 +597,21 @@ void *ght_next(ght_hash_table_t *p_ht, ght_iterator_t *p_iterator, const void **
 
 void *ght_next_keysize(ght_hash_table_t *p_ht, ght_iterator_t *p_iterator, const void **pp_key, unsigned int *size);
 
+
+
+
+void *lockless_ght_first(ght_hash_table_t *p_ht, lockless_ght_iterator_t *p_iterator, const void **p_key);
+
+void *lockless_ght_first_keysize(ght_hash_table_t *p_ht, lockless_ght_iterator_t *p_iterator, const void **p_key, unsigned int *size);
+
+
+
+void *lockless_ght_next(ght_hash_table_t *p_ht, lockless_ght_iterator_t *p_iterator, const void **pp_key);
+
+void *lockless_ght_next_keysize(ght_hash_table_t *p_ht, lockless_ght_iterator_t *p_iterator, const void **pp_key, unsigned int *size);
+
+
+
 /**
  * Rehash the hash table.
  *
@@ -595,6 +694,32 @@ ght_uint32_t ght_rotating_hash(ght_hash_key_t *p_key);
  */
 ght_uint32_t ght_crc_hash(ght_hash_key_t *p_key);
 
+int CAS1(ght_hash_entry_t **addr, ght_hash_entry_t **old, ght_hash_entry_t **new);
+
+int CAS2(ght_hash_entry_t **addr, ght_hash_entry_t *old, ght_hash_entry_t **new);
+
+int UnMark(ght_hash_entry_t **addr);
+
+void inline FAA(unsigned int *address, int value);
+
+int Mark_delete(ght_hash_entry_t **addr);
+
+int Mark_iteration(ght_hash_entry_t **addr);
+
+int UnMark_iteration(ght_hash_entry_t **addr);
+
+int Has_Delete_Mark(ght_hash_entry_t **addr);
+
+int Has_Iteration_Mark(ght_hash_entry_t **addr);
+
+int Force_Mark_Delete(ght_hash_entry_t **addr);
+
+int UnMark_delete(ght_hash_entry_t **addr);
+
+int Release(uint64_t *addr);
+
+int safeRead(uint64_t *addr);
+
 #ifdef USE_PROFILING
 /**
  * Print some statistics about the table. Only available if the
@@ -608,3 +733,5 @@ void ght_print(ght_hash_table_t *p_ht);
 #endif
 
 #endif /* GHT_HASH_TABLE_H */
+
+
